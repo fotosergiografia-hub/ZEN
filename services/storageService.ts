@@ -1,12 +1,23 @@
 import { Task, ProjectList } from '../types';
-import { supabase } from '../supabaseClient';
+import { supabase, isSupabaseConfigured } from '../supabaseClient';
 
 const STORAGE_KEY_LISTS = 'zendo_lists';
+const STORAGE_KEY_TASKS = 'zendo_tasks';
 
 export const storageService = {
-  // --- TASKS (Supabase) ---
+  // --- TASKS ---
 
   fetchTasks: async (): Promise<Task[]> => {
+    // FALLBACK: Use LocalStorage if Supabase is not configured to prevent errors
+    if (!isSupabaseConfigured) {
+      try {
+        const stored = localStorage.getItem(STORAGE_KEY_TASKS);
+        return stored ? JSON.parse(stored) : [];
+      } catch (e) {
+        return [];
+      }
+    }
+
     try {
       const { data, error } = await supabase
         .from('task')
@@ -14,7 +25,7 @@ export const storageService = {
         .order('order_index', { ascending: true });
 
       if (error) {
-        console.error('Error fetching tasks:', error);
+        console.error('Error fetching tasks:', error.message || error);
         return [];
       }
 
@@ -28,14 +39,21 @@ export const storageService = {
         listId: row.list_id,
         order: row.order_index
       }));
-    } catch (e) {
-      console.error("Unexpected error fetching tasks", e);
+    } catch (e: any) {
+      console.error("Unexpected error fetching tasks:", e.message || e);
       return [];
     }
   },
 
   addTask: async (task: Task) => {
-    // Optimistic update happens in App.tsx, this is fire-and-forget or handled async
+    // FALLBACK
+    if (!isSupabaseConfigured) {
+      const tasks = JSON.parse(localStorage.getItem(STORAGE_KEY_TASKS) || '[]');
+      tasks.push(task);
+      localStorage.setItem(STORAGE_KEY_TASKS, JSON.stringify(tasks));
+      return;
+    }
+
     const { error } = await supabase.from('task').insert({
       id: task.id,
       title: task.content,
@@ -46,10 +64,21 @@ export const storageService = {
       order_index: task.order
     });
 
-    if (error) console.error('Error adding task:', error);
+    if (error) console.error('Error adding task:', error.message || error);
   },
 
   updateTask: async (task: Task) => {
+    // FALLBACK
+    if (!isSupabaseConfigured) {
+      const tasks: Task[] = JSON.parse(localStorage.getItem(STORAGE_KEY_TASKS) || '[]');
+      const index = tasks.findIndex(t => t.id === task.id);
+      if (index !== -1) {
+        tasks[index] = task;
+        localStorage.setItem(STORAGE_KEY_TASKS, JSON.stringify(tasks));
+      }
+      return;
+    }
+
     const { error } = await supabase.from('task').update({
       title: task.content,
       is_completed: task.isCompleted,
@@ -59,12 +88,20 @@ export const storageService = {
       order_index: task.order
     }).eq('id', task.id);
 
-    if (error) console.error('Error updating task:', error);
+    if (error) console.error('Error updating task:', error.message || error);
   },
 
   deleteTask: async (taskId: string) => {
+    // FALLBACK
+    if (!isSupabaseConfigured) {
+      const tasks: Task[] = JSON.parse(localStorage.getItem(STORAGE_KEY_TASKS) || '[]');
+      const newTasks = tasks.filter(t => t.id !== taskId);
+      localStorage.setItem(STORAGE_KEY_TASKS, JSON.stringify(newTasks));
+      return;
+    }
+
     const { error } = await supabase.from('task').delete().eq('id', taskId);
-    if (error) console.error('Error deleting task:', error);
+    if (error) console.error('Error deleting task:', error.message || error);
   },
 
   // --- LISTS (Keeping LocalStorage for simplicity as user only specified Task table) ---
