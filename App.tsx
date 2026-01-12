@@ -15,7 +15,6 @@ const App: React.FC = () => {
 
   // --- Initialization ---
   useEffect(() => {
-    // Determine the Monday of the current week
     const now = new Date();
     
     // Format Header Date
@@ -23,19 +22,22 @@ const App: React.FC = () => {
     setTodayDateFormatted(now.toLocaleDateString('en-US', options));
 
     const day = now.getDay();
-    const diff = now.getDate() - day + (day === 0 ? -6 : 1); // Adjust when day is Sunday
+    const diff = now.getDate() - day + (day === 0 ? -6 : 1); 
     const monday = new Date(now.setDate(diff));
     monday.setHours(0, 0, 0, 0);
     setCurrentWeekStart(monday);
 
-    setTasks(storageService.loadTasks());
-    setLists(storageService.loadLists());
+    // Initial Load
+    const loadData = async () => {
+      const loadedTasks = await storageService.fetchTasks();
+      setTasks(loadedTasks);
+      setLists(storageService.loadLists());
+    };
+    loadData();
   }, []);
 
-  // --- Persistence ---
-  useEffect(() => {
-    if (tasks.length > 0) storageService.saveTasks(tasks);
-  }, [tasks]);
+  // Removed useEffect for saving tasks to avoid overwriting DB on load or creating loops.
+  // We now use explicit CRUD calls in handlers.
 
   useEffect(() => {
     if (lists.length > 0) storageService.saveLists(lists);
@@ -61,52 +63,74 @@ const App: React.FC = () => {
     return days;
   }, [currentWeekStart]);
 
-  // --- Task Actions ---
+  // --- Task Actions (Optimistic UI + DB Sync) ---
+  
   const addTask = (content: string, dateOrListId: string, time?: string, listId?: string) => {
     const isDate = dateOrListId.match(/^\d{4}-\d{2}-\d{2}$/);
-    
-    // Automatic logic: If specific time chosen, use it.
-    // If user adds to "Project List" directly (ProjectSection), date is undefined.
     
     const newTask: Task = {
       id: uuidv4(),
       content,
       isCompleted: false,
       date: isDate ? dateOrListId : undefined,
-      listId: listId || (isDate ? undefined : dateOrListId), // If first arg is listId, use it. If arg 4 is provided, use that.
+      listId: listId || (isDate ? undefined : dateOrListId),
       time: time,
       order: Date.now(),
     };
     
+    // Optimistic Update
     setTasks(prev => [...prev, newTask]);
+    
+    // DB Sync
+    storageService.addTask(newTask);
   };
 
   const toggleTask = (id: string) => {
+    // Find task to update for DB
+    const taskToUpdate = tasks.find(t => t.id === id);
+    
+    // Optimistic Update
     setTasks(prev => prev.map(t => 
       t.id === id ? { ...t, isCompleted: !t.isCompleted } : t
     ));
+
+    // DB Sync
+    if (taskToUpdate) {
+      storageService.updateTask({ ...taskToUpdate, isCompleted: !taskToUpdate.isCompleted });
+    }
   };
 
   const deleteTask = (id: string) => {
+    // Optimistic Update
     setTasks(prev => prev.filter(t => t.id !== id));
+    
+    // DB Sync
+    storageService.deleteTask(id);
   };
 
   const updateTask = (id: string, content: string) => {
+    const taskToUpdate = tasks.find(t => t.id === id);
+
     setTasks(prev => prev.map(t => t.id === id ? { ...t, content } : t));
+
+    if (taskToUpdate) {
+      storageService.updateTask({ ...taskToUpdate, content });
+    }
   };
 
   const moveTask = (taskId: string, destinationId: string, timeBlock?: TimeBlock) => {
     const isDate = destinationId.match(/^\d{4}-\d{2}-\d{2}$/);
     
+    let updatedTask: Task | null = null;
+
     setTasks(prev => prev.map(t => {
       if (t.id !== taskId) return t;
       
       const updates: Partial<Task> = {
         date: isDate ? destinationId : undefined,
-        listId: isDate ? t.listId : destinationId // Keep existing listId if moving between days, else set to new list
+        listId: isDate ? t.listId : destinationId
       };
 
-      // Handle dragging to specific Morning/Evening blocks
       if (isDate && timeBlock) {
         if (timeBlock === 'morning') {
            const currentHour = t.time ? parseInt(t.time.split(':')[0]) : 9;
@@ -125,17 +149,24 @@ const App: React.FC = () => {
         }
       }
 
-      // If moving to a Project List (not date), clear the date and time
       if (!isDate) {
         updates.date = undefined;
         updates.time = undefined;
       }
 
-      return { ...t, ...updates };
+      updatedTask = { ...t, ...updates };
+      return updatedTask;
     }));
+
+    // DB Sync
+    // We use setTimeout to allow the state to settle or just fire it, 
+    // but since we captured 'updatedTask' in the closure, we can send it.
+    if (updatedTask) {
+      storageService.updateTask(updatedTask);
+    }
   };
 
-  // --- List Actions ---
+  // --- List Actions (Still LocalStorage for now) ---
   const addList = (title: string) => {
     const newList: ProjectList = {
       id: uuidv4(),
@@ -147,6 +178,13 @@ const App: React.FC = () => {
 
   const deleteList = (id: string) => {
     setLists(prev => prev.filter(l => l.id !== id));
+    // When deleting a list, we should probably update tasks in that list to have no listId
+    // But for now, we just remove them from view or keep them?
+    // Let's clear the listId for tasks in that list in DB
+    const tasksInList = tasks.filter(t => t.listId === id);
+    tasksInList.forEach(t => {
+      storageService.updateTask({ ...t, listId: undefined });
+    });
     setTasks(prev => prev.map(t => t.listId === id ? { ...t, listId: undefined } : t));
   };
 
@@ -154,12 +192,19 @@ const App: React.FC = () => {
   
   const pushUnfinishedToToday = () => {
     const todayStr = new Date().toISOString().split('T')[0];
+    const updates: Task[] = [];
+
     setTasks(prev => prev.map(t => {
       if (t.date && t.date < todayStr && !t.isCompleted) {
-        return { ...t, date: todayStr };
+        const updated = { ...t, date: todayStr };
+        updates.push(updated);
+        return updated;
       }
       return t;
     }));
+
+    // Batch update DB
+    updates.forEach(t => storageService.updateTask(t));
   };
 
   const hasUnfinishedPastTasks = tasks.some(t => {
@@ -197,7 +242,7 @@ const App: React.FC = () => {
             key={day.date}
             dayInfo={day}
             tasks={tasks.filter(t => t.date === day.date)}
-            lists={lists} // Pass lists for dropdown
+            lists={lists} 
             onAddTask={addTask}
             onToggleTask={toggleTask}
             onDeleteTask={deleteTask}
